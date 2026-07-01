@@ -21,6 +21,7 @@ export interface RadarWebglRenderOptions {
   debugMode?: RadarWebglDebugMode;
   debugFlatMode?: boolean;
   debugBoundaryOutlines?: boolean;
+  devicePixelRatio?: number;
 }
 
 export type RadarWebglDebugMode = "reflectivity" | "flat" | "radials" | "nodata";
@@ -53,18 +54,20 @@ void main() {
     return;
   }
 
-  float radialCell = floor(v_polarCoord.x);
-  radialCell = mod(radialCell, u_polarTextureSize.x);
-  vec2 polarCell = vec2(
-    radialCell,
-    floor(v_polarCoord.y * u_polarTextureSize.y - 0.0001)
-  );
-  polarCell = clamp(polarCell, vec2(0.0), u_polarTextureSize - vec2(1.0));
+  float radialCell = floor(v_polarCoord.x + 0.001);
+  radialCell = clamp(radialCell, 0.0, u_polarTextureSize.x - 1.0);
+  float rangeCell = floor(clamp(v_polarCoord.y, 0.0, 0.999999) * u_polarTextureSize.y);
+  vec2 polarCell = vec2(radialCell, rangeCell);
   vec2 polarSampleCoord = (polarCell + vec2(0.5)) / u_polarTextureSize;
   vec4 dataValue = texture2D(u_polarTexture, polarSampleCoord);
 
+  if (u_debugMode > 2.5) {
+    gl_FragColor = vec4(polarSampleCoord, dataValue.a, 1.0);
+    return;
+  }
+
   if (dataValue.a <= 0.001) {
-    if (u_debugMode > 2.5) {
+    if (u_debugMode > 1.5) {
       gl_FragColor = vec4(1.0, 0.0, 0.85, 0.22);
       return;
     }
@@ -126,6 +129,16 @@ export class RadarWebglRenderer {
     });
 
     this.gl = gl;
+
+    if (typeof window !== "undefined") {
+      (window as any).__radarWebglRenderer = (window as any).__radarWebglRenderer || {
+        renders: 0,
+        draws: 0,
+        lastRender: null,
+        lastDraw: null,
+        errors: []
+      };
+    }
 
     if (!gl) {
       this.program = null;
@@ -239,11 +252,12 @@ export class RadarWebglRenderer {
     }
 
     const resized = this.resizeCanvas();
+    const devicePixelRatio = options.devicePixelRatio ?? (window.devicePixelRatio || 1);
     const viewSignature = buildMapViewSignature(
       options.map,
       this.canvas.clientWidth,
       this.canvas.clientHeight,
-      window.devicePixelRatio || 1
+      devicePixelRatio
     );
     const rebuildAll =
       options.forceRebuild ||
@@ -260,17 +274,40 @@ export class RadarWebglRenderer {
       ),
       width: this.canvas.clientWidth,
       height: this.canvas.clientHeight,
-      devicePixelRatio: window.devicePixelRatio || 1,
+      devicePixelRatio,
       radialCountHint: options.radialCountHint,
       radialOverlapPaddingDegrees: options.radialOverlapPaddingDegrees
     };
 
-    this.rebuildMesh(
-      options.map,
-      options.site,
-      orderedAllRadials,
-      geometryContext
-    );
+    if (typeof window !== "undefined") {
+      const debug = (window as any).__radarWebglRenderer;
+      if (debug) {
+        debug.renders += 1;
+        debug.lastRender = {
+          rebuildAll,
+          resized,
+          currentFieldKey: this.currentFieldKey,
+          nextFieldKey: options.fieldKey,
+          currentViewSignature: this.currentViewSignature,
+          nextViewSignature: viewSignature,
+          devicePixelRatio,
+          meshVertexCount: this.meshVertexCount,
+          meshIndexCount: this.meshIndexCount,
+          polarTextureSize: this.polarTextureSize,
+          allRadials: orderedAllRadials.length,
+          changedRadials: options.changedRadials ? Array.from(options.changedRadials).length : 0
+        };
+      }
+    }
+
+    if (rebuildAll) {
+      this.rebuildMesh(
+        options.map,
+        options.site,
+        orderedAllRadials,
+        geometryContext
+      );
+    }
 
     this.currentFieldKey = options.fieldKey;
     this.currentViewSignature = viewSignature;
@@ -467,6 +504,21 @@ export class RadarWebglRenderer {
       return;
     }
 
+    if (typeof window !== "undefined") {
+      const debug = (window as any).__radarWebglRenderer;
+      if (debug) {
+        debug.draws += 1;
+        debug.lastDraw = {
+          meshVertexCount: this.meshVertexCount,
+          meshIndexCount: this.meshIndexCount,
+          polarTextureSize: this.polarTextureSize,
+          currentFieldKey: this.currentFieldKey,
+          debugBoundaryOutlines,
+          viewport: { width: this.canvas.width, height: this.canvas.height }
+        };
+      }
+    }
+
     this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     this.gl.clearColor(0, 0, 0, 0);
     this.gl.clear(this.gl.COLOR_BUFFER_BIT);
@@ -494,6 +546,18 @@ export class RadarWebglRenderer {
         Math.max(1, this.polarTextureSize.radialCellCount),
         Math.max(1, this.polarTextureSize.rangeCellCount)
       );
+    }
+
+    if (typeof window !== "undefined") {
+      const debug = (window as any).__radarWebglRenderer;
+      if (debug) {
+        debug.lastDraw.uniforms = {
+          polarTextureSize: this.polarTextureSize,
+          viewport: { width: this.canvas.width, height: this.canvas.height },
+          debugMode: debugMode,
+          boundaryOutlines: debugBoundaryOutlines
+        };
+      }
     }
 
     if (this.debugModeLocation) {

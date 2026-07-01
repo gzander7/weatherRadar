@@ -5,6 +5,7 @@ const chunkBucket = "https://unidata-nexrad-level2-chunks.s3.amazonaws.com";
 const archiveBucket = "https://noaa-nexrad-level2.s3.amazonaws.com";
 const chunkPrefixRefreshMs = 5 * 60 * 1000;
 const baseReflectivityRadialResolution = 720;
+const baseReflectivityMaxRangeSamples = 920;
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -225,7 +226,7 @@ function sampleMomentToBins(moment, azimuth) {
     return { bins: [], reason: "moment-data-empty" };
   }
 
-  const stride = Math.max(1, Math.ceil(values.length / 240));
+  const stride = Math.max(1, Math.ceil(values.length / baseReflectivityMaxRangeSamples));
   const bins = [];
   let filteredGateCount = 0;
 

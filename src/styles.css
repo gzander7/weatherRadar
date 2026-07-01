@@ -190,6 +190,32 @@ dt {
   padding: 10px 12px;
 }
 
+.map-toolbar-action {
+  align-self: stretch;
+  min-height: 58px;
+  border: 1px solid rgba(255, 228, 138, 0.22);
+  border-radius: 14px;
+  background: rgba(255, 228, 138, 0.08);
+  color: #ffe48a;
+  padding: 10px 16px;
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.map-toolbar-action:hover:not(:disabled) {
+  background: rgba(255, 228, 138, 0.16);
+}
+
+.map-toolbar-action:disabled {
+  cursor: default;
+  opacity: 0.78;
+}
+
+.map-toolbar-action.is-active {
+  background: rgba(255, 228, 138, 0.18);
+}
+
 .map-toolbar-stat {
   min-width: 120px;
   padding: 10px 14px;
@@ -202,12 +228,17 @@ dt {
   font-size: 1.1rem;
 }
 
+.active-radar-stat strong {
+  color: #dff6ff;
+}
+
 .radar-map-shell {
   position: relative;
   min-height: 540px;
   overflow: hidden;
   border-radius: 24px;
   border: 1px solid rgba(255, 255, 255, 0.08);
+  contain: layout paint size;
 }
 
 .map-container {
@@ -258,6 +289,34 @@ dt {
   pointer-events: none;
 }
 
+.radar-debug-interaction {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  z-index: 5;
+  display: grid;
+  gap: 4px;
+  padding: 10px 12px;
+  border-radius: 14px;
+  background: rgba(10, 64, 138, 0.86);
+  border: 1px solid rgba(109, 188, 255, 0.18);
+  color: #d5e8ff;
+  font-size: 0.8rem;
+  line-height: 1.35;
+  pointer-events: none;
+}
+
+.radar-debug-interaction strong {
+  display: block;
+  font-size: 0.85rem;
+  color: #ffffff;
+}
+
+.radar-debug-interaction span {
+  display: block;
+  color: #bcd9ff;
+}
+
 .radar-field-overlay {
   position: absolute;
   inset: 0;
@@ -265,6 +324,7 @@ dt {
   height: 100%;
   z-index: 2;
   pointer-events: none;
+  transform-origin: 0 0;
 }
 
 .radar-render-canvas {
@@ -284,6 +344,17 @@ dt {
   height: 100%;
   z-index: 3;
   pointer-events: none;
+}
+
+.radar-map-loading {
+  display: grid;
+  place-items: center;
+  min-height: 540px;
+  border-radius: 24px;
+  border: 1px dashed rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.03);
+  color: #c7d8ef;
+  font-size: 0.95rem;
 }
 
 .map-notes {

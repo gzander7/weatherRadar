@@ -1,12 +1,14 @@
-import type { Map as MapLibreMap } from "maplibre-gl";
+import { MercatorCoordinate, type Map as MapLibreMap } from "maplibre-gl";
 import type { PolarRadialData } from "./radarPolarField";
 import { normalizeReflectivityValue } from "./reflectivityColorScale";
 import {
   angularMidpointDegrees,
+  destinationPoint,
   normalizeAngleDegrees,
   projectRangeAzimuthToScreen,
   type GeoPoint
 } from "./radarProjection";
+import { repairIsolatedPolarTextureRadialGaps } from "./radarTextureGapRepair";
 
 const defaultRadialOverlapPaddingDegrees = 0.08;
 const maxRadialOverlapPaddingDegrees = 0.25;
@@ -32,6 +34,13 @@ export interface RadarPolarTextureMeshData {
   boundaryVertexData: Float32Array;
   radialCellCount: number;
   rangeCellCount: number;
+}
+
+export type RadarMercatorTextureMeshData = RadarPolarTextureMeshData;
+
+export interface RadarMercatorTextureBuildOptions {
+  radialCountHint?: number;
+  radialOverlapPaddingDegrees?: number;
 }
 
 export function sortByRadialIndex<T extends { radialIndex: number }>(radials: Iterable<T>) {
@@ -451,6 +460,10 @@ export function buildRadarPolarTextureMeshData(
   const pointCache = new Map<string, { x: number; y: number }>();
   let vertexCursor = 0;
   let boundaryCursor = 0;
+  let minX = Number.POSITIVE_INFINITY;
+  let maxX = Number.NEGATIVE_INFINITY;
+  let minY = Number.POSITIVE_INFINITY;
+  let maxY = Number.NEGATIVE_INFINITY;
 
   const getProjectedPoint = (azimuthDegrees: number, rangeKm: number) => {
     const cacheKey = `${azimuthDegrees.toFixed(6)}:${rangeKm.toFixed(4)}`;
@@ -465,6 +478,11 @@ export function buildRadarPolarTextureMeshData(
       x: projected.x * context.devicePixelRatio,
       y: projected.y * context.devicePixelRatio
     };
+
+    minX = Math.min(minX, point.x);
+    maxX = Math.max(maxX, point.x);
+    minY = Math.min(minY, point.y);
+    maxY = Math.max(maxY, point.y);
 
     pointCache.set(cacheKey, point);
     return point;
@@ -518,6 +536,9 @@ export function buildRadarPolarTextureMeshData(
   const polarTexture = new Uint8Array(radialCellCount * rangeCellCount * 4);
   let indexCursor = 0;
 
+  let alphaCount = 0;
+  let totalCount = 0;
+
   for (let radialColumn = 0; radialColumn < sortedRadials.length; radialColumn += 1) {
     const radial = sortedRadials[radialColumn];
     const alternationValue = radialColumn % 2 === 0 ? 64 : 192;
@@ -549,8 +570,30 @@ export function buildRadarPolarTextureMeshData(
         polarTexture[textureOffset + 1] = alternationValue;
         polarTexture[textureOffset + 2] = encodedValue;
         polarTexture[textureOffset + 3] = encodedOpacity;
+        totalCount += 1;
+        if (encodedOpacity > 0) {
+          alphaCount += 1;
+        }
       }
     }
+  }
+
+  const repairedGapCellCount = repairIsolatedPolarTextureRadialGaps(
+    polarTexture,
+    radialCellCount,
+    rangeCellCount
+  );
+
+  if (typeof window !== "undefined") {
+    (window as any).__radarWebglRenderer = (window as any).__radarWebglRenderer || {};
+    (window as any).__radarWebglRenderer.lastBuild = {
+      radialCellCount,
+      rangeCellCount,
+      totalTextureCells: totalCount,
+      alphaTextureCells: alphaCount,
+      alphaCoverage: totalCount > 0 ? alphaCount / totalCount : 0,
+      repairedGapCellCount
+    };
   }
 
   for (let radialColumn = 0; radialColumn < radialCellCount; radialColumn += 1) {
@@ -570,6 +613,259 @@ export function buildRadarPolarTextureMeshData(
       indexData[indexCursor + 5] = bottomLeft;
       indexCursor += 6;
     }
+  }
+
+  const result = {
+    vertexData,
+    indexData,
+    polarTexture,
+    boundaryVertexData,
+    radialCellCount,
+    rangeCellCount
+  };
+
+  if (typeof window !== "undefined") {
+    (window as any).__radarWebglRenderer = (window as any).__radarWebglRenderer || {};
+    (window as any).__radarWebglRenderer.lastBounds = {
+      minX,
+      maxX,
+      minY,
+      maxY,
+      width: maxX === Number.NEGATIVE_INFINITY ? 0 : maxX - minX,
+      height: maxY === Number.NEGATIVE_INFINITY ? 0 : maxY - minY
+    };
+  }
+
+  return result;
+}
+
+function projectRangeAzimuthToMercator(
+  site: GeoPoint,
+  azimuthDegrees: number,
+  rangeKm: number
+) {
+  const coordinate = destinationPoint(
+    site.latitude,
+    site.longitude,
+    normalizeAngleDegrees(azimuthDegrees),
+    rangeKm
+  );
+  const mercator = MercatorCoordinate.fromLngLat([
+    coordinate.longitude,
+    coordinate.latitude
+  ]);
+
+  return {
+    x: mercator.x,
+    y: mercator.y
+  };
+}
+
+export function buildRadarMercatorTextureMeshData(
+  site: GeoPoint,
+  radials: PolarRadialData[],
+  options: RadarMercatorTextureBuildOptions = {}
+): RadarMercatorTextureMeshData {
+  const sortedRadials = sortByRadialAzimuth(radials);
+  const radialCellCount = sortedRadials.length;
+
+  if (radialCellCount === 0) {
+    return {
+      vertexData: new Float32Array(0),
+      indexData: new Uint16Array(0),
+      polarTexture: new Uint8Array(0),
+      boundaryVertexData: new Float32Array(0),
+      radialCellCount: 0,
+      rangeCellCount: 0
+    };
+  }
+
+  const rangeEdgeKeys = new Map<string, number>();
+  const rangeEdges: number[] = [0];
+
+  for (const radial of sortedRadials) {
+    for (let gateIndex = 0; gateIndex < radial.gateCount; gateIndex += 1) {
+      const start = Math.max(0, radial.rangeStartKm[gateIndex]);
+      const end = Math.max(start + 0.01, radial.rangeEndKm[gateIndex]);
+
+      for (const value of [start, end]) {
+        const key = value.toFixed(4);
+
+        if (!rangeEdgeKeys.has(key)) {
+          rangeEdgeKeys.set(key, value);
+          rangeEdges.push(value);
+        }
+      }
+    }
+  }
+
+  rangeEdges.sort((left, right) => left - right);
+  const rangeEdgeIndex = new Map<string, number>();
+
+  for (let index = 0; index < rangeEdges.length; index += 1) {
+    rangeEdgeIndex.set(rangeEdges[index].toFixed(4), index);
+  }
+
+  const rangeCellCount = Math.max(0, rangeEdges.length - 1);
+
+  if (rangeCellCount === 0) {
+    return {
+      vertexData: new Float32Array(0),
+      indexData: new Uint16Array(0),
+      polarTexture: new Uint8Array(0),
+      boundaryVertexData: new Float32Array(0),
+      radialCellCount,
+      rangeCellCount
+    };
+  }
+
+  const radialEdgeCount = radialCellCount + 1;
+  const verticesPerRadial = (rangeCellCount + 1) * 2;
+  const vertexCount = radialCellCount * verticesPerRadial;
+  const vertexData = new Float32Array(vertexCount * 4);
+  const boundaryVertexData = new Float32Array(radialEdgeCount * 2 * 4);
+  const radialEdgeAngles = resolveSharedRadialEdgeAngles(sortedRadials);
+  const pointCache = new Map<string, { x: number; y: number }>();
+  let vertexCursor = 0;
+  let boundaryCursor = 0;
+
+  const getMercatorPoint = (azimuthDegrees: number, rangeKm: number) => {
+    const cacheKey = `${azimuthDegrees.toFixed(6)}:${rangeKm.toFixed(4)}`;
+    const cached = pointCache.get(cacheKey);
+
+    if (cached) {
+      return cached;
+    }
+
+    const point = projectRangeAzimuthToMercator(site, azimuthDegrees, rangeKm);
+    pointCache.set(cacheKey, point);
+    return point;
+  };
+
+  for (let radialColumn = 0; radialColumn < radialCellCount; radialColumn += 1) {
+    const leftAzimuthDegrees = radialEdgeAngles[radialColumn];
+    const rightAzimuthDegrees = radialEdgeAngles[radialColumn + 1];
+    const polarCellX = radialColumn + 0.5;
+
+    for (let rangeEdgeIndexValue = 0; rangeEdgeIndexValue <= rangeCellCount; rangeEdgeIndexValue += 1) {
+      const rangeKm = rangeEdges[rangeEdgeIndexValue];
+      const left = getMercatorPoint(leftAzimuthDegrees, rangeKm);
+      const right = getMercatorPoint(rightAzimuthDegrees, rangeKm);
+      const textureY = rangeCellCount <= 0 ? 0 : rangeEdgeIndexValue / rangeCellCount;
+
+      vertexData[vertexCursor] = left.x;
+      vertexData[vertexCursor + 1] = left.y;
+      vertexData[vertexCursor + 2] = polarCellX;
+      vertexData[vertexCursor + 3] = textureY;
+      vertexData[vertexCursor + 4] = right.x;
+      vertexData[vertexCursor + 5] = right.y;
+      vertexData[vertexCursor + 6] = polarCellX;
+      vertexData[vertexCursor + 7] = textureY;
+      vertexCursor += 8;
+    }
+  }
+
+  for (let edgeIndex = 0; edgeIndex <= radialCellCount; edgeIndex += 1) {
+    const azimuthDegrees = radialEdgeAngles[edgeIndex];
+    const polarCellX = edgeIndex;
+    const inner = getMercatorPoint(azimuthDegrees, rangeEdges[0]);
+    const outer = getMercatorPoint(azimuthDegrees, rangeEdges[rangeEdges.length - 1]);
+
+    boundaryVertexData[boundaryCursor] = inner.x;
+    boundaryVertexData[boundaryCursor + 1] = inner.y;
+    boundaryVertexData[boundaryCursor + 2] = polarCellX;
+    boundaryVertexData[boundaryCursor + 3] = 0;
+    boundaryVertexData[boundaryCursor + 4] = outer.x;
+    boundaryVertexData[boundaryCursor + 5] = outer.y;
+    boundaryVertexData[boundaryCursor + 6] = polarCellX;
+    boundaryVertexData[boundaryCursor + 7] = 1;
+    boundaryCursor += 8;
+  }
+
+  const cellCount = radialCellCount * rangeCellCount;
+  const indexCount = cellCount * 6;
+  const useUint32 = vertexCount > 65535;
+  const indexData = useUint32 ? new Uint32Array(indexCount) : new Uint16Array(indexCount);
+  const polarTexture = new Uint8Array(radialCellCount * rangeCellCount * 4);
+  let indexCursor = 0;
+  let alphaCount = 0;
+  let totalCount = 0;
+
+  for (let radialColumn = 0; radialColumn < sortedRadials.length; radialColumn += 1) {
+    const radial = sortedRadials[radialColumn];
+    const alternationValue = radialColumn % 2 === 0 ? 64 : 192;
+
+    for (let gateIndex = 0; gateIndex < radial.gateCount; gateIndex += 1) {
+      const startIndex =
+        rangeEdgeIndex.get(Math.max(0, radial.rangeStartKm[gateIndex]).toFixed(4)) ?? -1;
+      const endIndex =
+        rangeEdgeIndex.get(
+          Math.max(Math.max(0, radial.rangeStartKm[gateIndex]) + 0.01, radial.rangeEndKm[gateIndex]).toFixed(4)
+        ) ?? -1;
+
+      if (startIndex < 0 || endIndex < 0 || endIndex <= startIndex) {
+        continue;
+      }
+
+      const normalizedValue = normalizeReflectivityValue(
+        radial.intensity[gateIndex],
+        Number.isFinite(radial.reflectivityDbz[gateIndex])
+          ? radial.reflectivityDbz[gateIndex]
+          : undefined
+      );
+      const encodedValue = Math.round(Math.max(0, Math.min(1, normalizedValue)) * 255);
+      const encodedOpacity = Math.round(Math.max(0, Math.min(1, radial.displayOpacity)) * 255);
+
+      for (let rangeIndex = startIndex; rangeIndex < endIndex; rangeIndex += 1) {
+        const textureOffset = (rangeIndex * radialCellCount + radialColumn) * 4;
+        polarTexture[textureOffset] = encodedValue;
+        polarTexture[textureOffset + 1] = alternationValue;
+        polarTexture[textureOffset + 2] = encodedValue;
+        polarTexture[textureOffset + 3] = encodedOpacity;
+        totalCount += 1;
+        if (encodedOpacity > 0) {
+          alphaCount += 1;
+        }
+      }
+    }
+  }
+
+  const repairedGapCellCount = repairIsolatedPolarTextureRadialGaps(
+    polarTexture,
+    radialCellCount,
+    rangeCellCount
+  );
+
+  for (let radialColumn = 0; radialColumn < radialCellCount; radialColumn += 1) {
+    const radialVertexOffset = radialColumn * verticesPerRadial;
+
+    for (let rangeIndex = 0; rangeIndex < rangeCellCount; rangeIndex += 1) {
+      const topLeft = radialVertexOffset + rangeIndex * 2;
+      const topRight = topLeft + 1;
+      const bottomLeft = radialVertexOffset + (rangeIndex + 1) * 2;
+      const bottomRight = bottomLeft + 1;
+
+      indexData[indexCursor] = topLeft;
+      indexData[indexCursor + 1] = topRight;
+      indexData[indexCursor + 2] = bottomRight;
+      indexData[indexCursor + 3] = topLeft;
+      indexData[indexCursor + 4] = bottomRight;
+      indexData[indexCursor + 5] = bottomLeft;
+      indexCursor += 6;
+    }
+  }
+
+  if (typeof window !== "undefined") {
+    (window as any).__radarWebglRenderer = (window as any).__radarWebglRenderer || {};
+    (window as any).__radarWebglRenderer.lastBuild = {
+      radialCellCount,
+      rangeCellCount,
+      totalTextureCells: totalCount,
+      alphaTextureCells: alphaCount,
+      alphaCoverage: totalCount > 0 ? alphaCount / totalCount : 0,
+      repairedGapCellCount,
+      coordinateSpace: "mercator"
+    };
   }
 
   return {

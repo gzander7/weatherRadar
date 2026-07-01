@@ -1,5 +1,6 @@
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import maplibregl, {
+  type GeoJSONSource,
   type ImageSource,
   type LngLatLike,
   type Map as MapLibreMap,
@@ -15,7 +16,15 @@ import {
   sortPolarRadials,
   type PolarFieldState
 } from "../lib/radarPolarField";
-import { projectRangeAzimuthToScreen, type GeoPoint } from "../lib/radarProjection";
+import {
+  normalizeAngleDegrees,
+  projectRangeAzimuthToScreen,
+  type GeoPoint
+} from "../lib/radarProjection";
+import {
+  RadarMapLibreCustomLayerRenderer,
+  radarCustomLayerId
+} from "../lib/radarMapLibreCustomLayerRenderer";
 import { RadarWebglRenderer, type RadarWebglDebugMode } from "../lib/radarWebglRenderer";
 import { SweepBeamController } from "../lib/sweepBeamController";
 import type {
@@ -27,6 +36,9 @@ import type {
 interface RadarMapProps {
   sourceId: string;
   sourceKind: RadarSourceKind;
+  selectableSites?: SelectableRadarSite[];
+  activeSourceId?: string;
+  onSourceSelect?: (sourceId: string) => void;
   frameManifest?: LiveRadarFrameManifest;
   liveUpdate?: LiveRadarRadialBatch;
   bootstrapField?: LiveRadarRadialBatch;
@@ -34,13 +46,29 @@ interface RadarMapProps {
   rotationPeriodMs?: number;
 }
 
+export interface SelectableRadarSite {
+  sourceId: string;
+  code: string;
+  name: string;
+  latitude: number;
+  longitude: number;
+}
+
 interface RadarSiteRenderContext {
   site: GeoPoint;
   rangeKm: number;
+  label: string;
+}
+
+interface InteractionTransformState {
+  site: GeoPoint;
+  startZoom: number;
+  startPoint: { x: number; y: number };
 }
 
 const baseStyle: StyleSpecification = {
   version: 8,
+  glyphs: "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
   sources: {
     osm: {
       type: "raster",
@@ -79,7 +107,12 @@ const slotRadarDebugMode = radarDebugModes.has("slots");
 const radialGeometryDebugMode = radarDebugModes.has("radials");
 const noDataRadarDebugMode = radarDebugModes.has("nodata");
 const boundaryRadarDebugMode = radarDebugModes.has("bounds");
+const interactionRadarDebugMode = radarDebugModes.has("interaction");
+const screenSpaceRadarFallbackMode = radarDebugModes.has("screen");
 const defaultRadialOverlapPaddingDegrees = 0.08;
+const selectableRadarSitesSourceId = "radar-sites-selectable";
+const selectableRadarSitesCircleLayerId = "radar-sites-selectable-circle";
+const selectableRadarSitesLabelLayerId = "radar-sites-selectable-label";
 
 function radarWebglDebugMode(): RadarWebglDebugMode {
   if (noDataRadarDebugMode) {
@@ -95,6 +128,94 @@ function radarWebglDebugMode(): RadarWebglDebugMode {
   }
 
   return "reflectivity";
+}
+
+function buildSelectableRadarSitesGeoJson(
+  sites: SelectableRadarSite[],
+  activeSourceId: string
+) {
+  return {
+    type: "FeatureCollection" as const,
+    features: sites.map((site) => ({
+      type: "Feature" as const,
+      geometry: {
+        type: "Point" as const,
+        coordinates: [site.longitude, site.latitude] as [number, number]
+      },
+      properties: {
+        sourceId: site.sourceId,
+        code: site.code,
+        name: site.name,
+        active: site.sourceId === activeSourceId
+      }
+    }))
+  };
+}
+
+function updateSelectableRadarSitesSource(
+  map: MapLibreMap,
+  sites: SelectableRadarSite[],
+  activeSourceId: string
+) {
+  const data = buildSelectableRadarSitesGeoJson(sites, activeSourceId);
+  const source = map.getSource(selectableRadarSitesSourceId) as GeoJSONSource | undefined;
+
+  if (source) {
+    source.setData(data);
+  }
+}
+
+function ensureSelectableRadarSiteLayers(
+  map: MapLibreMap,
+  sites: SelectableRadarSite[],
+  activeSourceId: string
+) {
+  const data = buildSelectableRadarSitesGeoJson(sites, activeSourceId);
+
+  if (!map.getSource(selectableRadarSitesSourceId)) {
+    map.addSource(selectableRadarSitesSourceId, {
+      type: "geojson",
+      data
+    });
+  } else {
+    updateSelectableRadarSitesSource(map, sites, activeSourceId);
+  }
+
+  if (!map.getLayer(selectableRadarSitesCircleLayerId)) {
+    map.addLayer({
+      id: selectableRadarSitesCircleLayerId,
+      type: "circle",
+      source: selectableRadarSitesSourceId,
+      paint: {
+        "circle-radius": ["case", ["boolean", ["get", "active"], false], 10, 7],
+        "circle-color": ["case", ["boolean", ["get", "active"], false], "#dff6ff", "#6dbdff"],
+        "circle-opacity": ["case", ["boolean", ["get", "active"], false], 0.98, 0.72],
+        "circle-stroke-color": ["case", ["boolean", ["get", "active"], false], "#122942", "#07111f"],
+        "circle-stroke-width": ["case", ["boolean", ["get", "active"], false], 3, 2]
+      }
+    });
+  }
+
+  if (!map.getLayer(selectableRadarSitesLabelLayerId)) {
+    map.addLayer({
+      id: selectableRadarSitesLabelLayerId,
+      type: "symbol",
+      source: selectableRadarSitesSourceId,
+      layout: {
+        "text-field": ["get", "code"],
+        "text-font": ["Open Sans Semibold", "Arial Unicode MS Bold"],
+        "text-size": ["case", ["boolean", ["get", "active"], false], 13, 11],
+        "text-anchor": "left",
+        "text-offset": [1.1, 0],
+        "text-allow-overlap": true
+      },
+      paint: {
+        "text-color": ["case", ["boolean", ["get", "active"], false], "#ffffff", "#c9e6ff"],
+        "text-halo-color": "rgba(5, 14, 26, 0.92)",
+        "text-halo-width": 1.4
+      }
+    });
+  }
 }
 
 function rollingFieldKey(
@@ -140,6 +261,7 @@ function findRadarSite(sourceId: string, liveFrame?: LiveRadarFrameManifest) {
 
 function resolveRadarRenderSite(sourceId: string, liveFrame?: LiveRadarFrameManifest) {
   const knownSite = findRadarSite(sourceId, liveFrame);
+  const siteId = liveFrame?.site ?? knownSite?.id ?? siteIdFromSourceId(sourceId);
   const site =
     liveFrame?.siteLatitude != null && liveFrame?.siteLongitude != null
       ? {
@@ -159,8 +281,75 @@ function resolveRadarRenderSite(sourceId: string, liveFrame?: LiveRadarFrameMani
 
   return {
     site,
-    rangeKm: knownSite?.rangeKm ?? 180
+    rangeKm: knownSite?.rangeKm ?? 180,
+    label: siteId.toUpperCase()
   } satisfies RadarSiteRenderContext;
+}
+
+function finiteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function radarMapPropsSignature(props: Pick<RadarMapProps, "sourceId" | "sourceKind" | "frameManifest" | "liveUpdate" | "bootstrapField" | "allowSyntheticFallback">) {
+  const frame = props.frameManifest ?? props.liveUpdate?.frame ?? props.bootstrapField?.frame;
+  const frameKey = frame
+    ? `${frame.sourceId ?? "none"}:${frame.sequence ?? 0}:${frame.tiltIndex ?? 0}:${frame.chunkSequence ?? 0}`
+    : "none";
+  const liveKey = props.liveUpdate
+    ? `${props.liveUpdate.frame.sourceId}:${props.liveUpdate.sequence ?? 0}:${props.liveUpdate.radials.length}`
+    : "none";
+  const bootstrapKey = props.bootstrapField
+    ? `${props.bootstrapField.frame.sourceId}:${props.bootstrapField.sequence ?? 0}:${props.bootstrapField.radials.length}`
+    : "none";
+
+  return `${props.sourceId}:${props.sourceKind}:${frameKey}:${liveKey}:${bootstrapKey}:${props.allowSyntheticFallback ? 1 : 0}`;
+}
+
+function latestBatchSweepAngle(batch?: LiveRadarRadialBatch) {
+  const latestRadial = batch?.radials.at(-1);
+
+  if (!latestRadial) {
+    return null;
+  }
+
+  if (finiteNumber(latestRadial.azimuthEnd)) {
+    return normalizeAngleDegrees(latestRadial.azimuthEnd);
+  }
+
+  if (finiteNumber(latestRadial.azimuthStart)) {
+    return normalizeAngleDegrees(latestRadial.azimuthStart);
+  }
+
+  return null;
+}
+
+function frameSweepAngle(frame?: LiveRadarFrameManifest) {
+  if (!frame) {
+    return null;
+  }
+
+  if (finiteNumber(frame.sweepEndAzimuth)) {
+    return normalizeAngleDegrees(frame.sweepEndAzimuth);
+  }
+
+  if (finiteNumber(frame.sweepStartAzimuth)) {
+    return normalizeAngleDegrees(frame.sweepStartAzimuth);
+  }
+
+  return null;
+}
+
+function resolveDataSweepAngle(state: {
+  frameManifest?: LiveRadarFrameManifest;
+  liveUpdate?: LiveRadarRadialBatch;
+  bootstrapField?: LiveRadarRadialBatch;
+}) {
+  return (
+    latestBatchSweepAngle(state.liveUpdate) ??
+    frameSweepAngle(state.frameManifest) ??
+    latestBatchSweepAngle(state.bootstrapField) ??
+    frameSweepAngle(state.bootstrapField?.frame)
+  );
 }
 
 function webMercatorMeters(lng: number, lat: number) {
@@ -316,12 +505,19 @@ function drawFocusMarkers(
     ctx.lineWidth = 2;
     ctx.stroke();
     ctx.fillStyle = "#ffffff";
-    ctx.font = "600 24px Segoe UI";
-    ctx.fillText(point.label, projected.x + 12, projected.y + 8);
+    ctx.font = "600 18px Segoe UI";
+    ctx.fillText(point.label, projected.x + 12, projected.y - 2);
+    ctx.fillStyle = "rgba(235, 248, 255, 0.82)";
+    ctx.font = "600 11px Segoe UI";
+    ctx.fillText("focus", projected.x + 13, projected.y + 12);
   }
 }
 
-function drawSiteMarker(ctx: CanvasRenderingContext2D, map: MapLibreMap, site: GeoPoint) {
+function drawSiteMarker(
+  ctx: CanvasRenderingContext2D,
+  map: MapLibreMap,
+  site: GeoPoint
+) {
   const projected = map.project([site.longitude, site.latitude] as LngLatLike);
   ctx.beginPath();
   ctx.arc(projected.x, projected.y, 7, 0, Math.PI * 2);
@@ -402,9 +598,12 @@ function drawSweepBeam(
   ctx.stroke();
 }
 
-export function RadarMap({
+function RadarMapInner({
   sourceId,
   sourceKind,
+  selectableSites = [],
+  activeSourceId = sourceId,
+  onSourceSelect,
   frameManifest,
   liveUpdate,
   bootstrapField,
@@ -416,16 +615,39 @@ export function RadarMap({
   const sweepCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const fieldRendererRef = useRef<RadarWebglRenderer | null>(null);
+  const customFieldRendererRef = useRef<RadarMapLibreCustomLayerRenderer | null>(null);
   const sweepControllerRef = useRef<SweepBeamController | null>(null);
   const drawRef = useRef<(() => void) | null>(null);
+  const drawSweepRef = useRef<(() => void) | null>(null);
   const frameRef = useRef<number | null>(null);
+  const sweepFrameRef = useRef<number | null>(null);
+  const transformFrameRef = useRef<number | null>(null);
   const mrmsRefreshTimerRef = useRef<number | null>(null);
   const sweepAngleDegreesRef = useRef(0);
   const needsFullFieldRedrawRef = useRef(true);
   const fieldIdentityRef = useRef<string | null>(null);
+  const interactionActiveRef = useRef(false);
+  const interactionTransformRef = useRef<InteractionTransformState | null>(null);
+  const interactionRenderCountRef = useRef(0);
+  const lastFullRedrawMsRef = useRef<number | null>(null);
+  const [interactionDebugActive, setInteractionDebugActive] = useState(false);
+  const [interactionDebugStats, setInteractionDebugStats] = useState({
+    transformActive: false,
+    renderCount: 0,
+    lastFullRedrawMs: null as number | null,
+    customLayerRenderCount: 0,
+    customLayerDataRebuildCount: 0,
+    customLayerFps: 0
+  });
   const polarFieldCacheRef = useRef(new Map<string, PolarFieldState>());
+  const lastRenderSignatureRef = useRef<string | null>(null);
   const lastAppliedBootstrapRef = useRef(new Map<string, string>());
   const lastAppliedLiveUpdateRef = useRef(new Map<string, string>());
+  const selectionRef = useRef({
+    activeSourceId,
+    selectableSites,
+    onSourceSelect
+  });
   const stateRef = useRef({
     sourceId,
     sourceKind,
@@ -443,6 +665,46 @@ export function RadarMap({
         return `src ${sourceRadial} -> slot ${assignedSlot} az ${radial.azimuthStart.toFixed(2)}-${radial.azimuthEnd.toFixed(2)} vol ${(debugBatch.frame.volumeId ?? "none").slice(-12)} tilt ${debugBatch.frame.tiltIndex}`;
       })
     : [];
+
+  const debugInteraction = (...values: unknown[]) => {
+    if (!interactionRadarDebugMode) {
+      return;
+    }
+
+    console.debug("[RadarInteraction]", ...values);
+  };
+
+  const customLayerStats = () => (
+    customFieldRendererRef.current?.getStats() ?? {
+      renderCount: 0,
+      dataRebuildCount: 0,
+      lastDataRebuildMs: null,
+      fpsEstimate: 0,
+      lastFrameKind: "idle" as const
+    }
+  );
+
+  const refreshInteractionDebugStats = () => {
+    if (!interactionRadarDebugMode) {
+      return;
+    }
+
+    const stats = customLayerStats();
+    setInteractionDebugStats({
+      transformActive: Boolean(interactionTransformRef.current),
+      renderCount: interactionRenderCountRef.current,
+      lastFullRedrawMs: stats.lastDataRebuildMs ?? lastFullRedrawMsRef.current,
+      customLayerRenderCount: stats.renderCount,
+      customLayerDataRebuildCount: stats.dataRebuildCount,
+      customLayerFps: stats.fpsEstimate
+    });
+  };
+
+  selectionRef.current = {
+    activeSourceId,
+    selectableSites,
+    onSourceSelect
+  };
 
   stateRef.current = {
     sourceId,
@@ -467,14 +729,22 @@ export function RadarMap({
       attributionControl: false,
       interactive: true,
       dragPan: true,
+      dragRotate: false,
       scrollZoom: true,
       doubleClickZoom: true,
-      touchZoomRotate: true
+      touchZoomRotate: true,
+      pitchWithRotate: false
     });
 
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), "top-right");
+    map.touchZoomRotate.disableRotation();
     mapRef.current = map;
-    fieldRendererRef.current = new RadarWebglRenderer(fieldCanvasRef.current);
+    fieldRendererRef.current = screenSpaceRadarFallbackMode
+      ? new RadarWebglRenderer(fieldCanvasRef.current)
+      : null;
+    customFieldRendererRef.current = screenSpaceRadarFallbackMode
+      ? null
+      : new RadarMapLibreCustomLayerRenderer();
     sweepControllerRef.current = new SweepBeamController(rotationPeriodMs);
 
     const applyBasemapMood = () => {
@@ -492,6 +762,55 @@ export function RadarMap({
       map.setPaintProperty("osm", "raster-opacity", 0.56);
       map.setPaintProperty("osm", "raster-saturation", -0.88);
       map.setPaintProperty("osm", "raster-contrast", -0.28);
+    };
+
+    const clearFieldInteractionTransform = () => {
+      const fieldCanvas = fieldCanvasRef.current;
+
+      if (!fieldCanvas) {
+        return;
+      }
+
+      fieldCanvas.style.transform = "";
+      fieldCanvas.style.transformOrigin = "";
+      fieldCanvas.style.willChange = "";
+    };
+
+    const applyFieldInteractionTransform = () => {
+      const fieldCanvas = fieldCanvasRef.current;
+      const transformState = interactionTransformRef.current;
+
+      if (
+        customFieldRendererRef.current ||
+        !fieldCanvas ||
+        !transformState ||
+        stateRef.current.sourceKind === "mrms"
+      ) {
+        return;
+      }
+
+      const currentPoint = map.project([
+        transformState.site.longitude,
+        transformState.site.latitude
+      ] as LngLatLike);
+      const scale = 2 ** (map.getZoom() - transformState.startZoom);
+      const translateX = currentPoint.x - transformState.startPoint.x * scale;
+      const translateY = currentPoint.y - transformState.startPoint.y * scale;
+
+      fieldCanvas.style.transformOrigin = "0 0";
+      fieldCanvas.style.willChange = "transform";
+      fieldCanvas.style.transform = `translate(${translateX.toFixed(2)}px, ${translateY.toFixed(2)}px) scale(${scale.toFixed(5)})`;
+    };
+
+    const scheduleFieldInteractionTransform = () => {
+      if (transformFrameRef.current !== null) {
+        return;
+      }
+
+      transformFrameRef.current = window.requestAnimationFrame(() => {
+        transformFrameRef.current = null;
+        applyFieldInteractionTransform();
+      });
     };
 
     const redrawSweepOverlay = (angleOverride?: number) => {
@@ -512,6 +831,10 @@ export function RadarMap({
         stateRef.current.bootstrapField?.frame;
       const renderSite = resolveRadarRenderSite(stateRef.current.sourceId, liveFrame);
       const overlayState = prepareOverlayCanvas(sweepCanvas, true);
+      const sweepAngleDegrees =
+        resolveDataSweepAngle(stateRef.current) ??
+        angleOverride ??
+        sweepAngleDegreesRef.current;
 
       if (!overlayState || !renderSite) {
         clearOverlayCanvas(sweepCanvas);
@@ -523,22 +846,43 @@ export function RadarMap({
         map,
         renderSite.site,
         renderSite.rangeKm,
-        angleOverride ?? sweepAngleDegreesRef.current
+        sweepAngleDegrees
       );
       drawFocusMarkers(overlayState.ctx, map, stateRef.current.sourceId);
       drawSiteMarker(overlayState.ctx, map, renderSite.site);
     };
 
+    const scheduleSweepOverlayRedraw = (angleOverride?: number) => {
+      if (typeof angleOverride === "number") {
+        sweepAngleDegreesRef.current = angleOverride;
+      }
+
+      if (sweepFrameRef.current !== null) {
+        return;
+      }
+
+      sweepFrameRef.current = window.requestAnimationFrame(() => {
+        sweepFrameRef.current = null;
+        redrawSweepOverlay();
+      });
+    };
+
     const redrawField = () => {
       try {
-        if (!map.isStyleLoaded() || !fieldRendererRef.current) {
+        const screenRenderer = fieldRendererRef.current;
+        const customRenderer = customFieldRendererRef.current;
+
+        if (!map.isStyleLoaded() || (!screenRenderer && !customRenderer)) {
           return;
         }
+
+        const redrawStartMs = performance.now();
 
         applyBasemapMood();
 
         if (stateRef.current.sourceKind === "mrms") {
-          fieldRendererRef.current.clear();
+          screenRenderer?.clear();
+          customRenderer?.clear();
           removeMrmsLayer(map);
           updateMrmsImage(map);
           return;
@@ -637,22 +981,46 @@ export function RadarMap({
           const allRadials = sortPolarRadials(fieldCache.radialsByIndex.values());
 
           if (allRadials.length === 0) {
-            fieldRendererRef.current.clear();
+            screenRenderer?.clear();
+            customRenderer?.clear();
             return;
           }
 
-          fieldRendererRef.current.render({
-            map,
-            site: renderSite.site,
-            fieldKey: currentFieldKey,
-            allRadials,
-            changedRadials: patchRadials,
-            radialCountHint: liveFrame.radialCount ?? fieldCache.radialsByIndex.size,
-            radialOverlapPaddingDegrees: defaultRadialOverlapPaddingDegrees,
-            forceRebuild: forceFullRedraw,
-            debugMode: radarWebglDebugMode(),
-            debugBoundaryOutlines: boundaryRadarDebugMode
+          debugInteraction("render field", {
+            currentFieldKey,
+            forceFullRedraw,
+            changedRadialCount: patchRadials?.length ?? 0,
+            interactionActive: interactionActiveRef.current
           });
+
+          if (customRenderer) {
+            customRenderer.setData({
+              site: renderSite.site,
+              fieldKey: currentFieldKey,
+              allRadials,
+              radialCountHint: liveFrame.radialCount ?? fieldCache.radialsByIndex.size,
+              radialOverlapPaddingDegrees: defaultRadialOverlapPaddingDegrees,
+              forceRebuild: forceFullRedraw || Boolean(patchRadials?.length),
+              debugMode: radarWebglDebugMode(),
+              debugBoundaryOutlines: boundaryRadarDebugMode
+            });
+          } else {
+            screenRenderer?.render({
+              map,
+              site: renderSite.site,
+              fieldKey: currentFieldKey,
+              allRadials,
+              changedRadials: patchRadials,
+              radialCountHint: liveFrame.radialCount ?? fieldCache.radialsByIndex.size,
+              radialOverlapPaddingDegrees: defaultRadialOverlapPaddingDegrees,
+              forceRebuild: forceFullRedraw,
+              debugMode: radarWebglDebugMode(),
+              debugBoundaryOutlines: boundaryRadarDebugMode
+            });
+          }
+
+          lastFullRedrawMsRef.current = performance.now() - redrawStartMs;
+          refreshInteractionDebugStats();
 
           return;
         }
@@ -663,7 +1031,8 @@ export function RadarMap({
           const fallbackSite = findRadarSite(stateRef.current.sourceId);
 
           if (!fallbackFrame || !fallbackSite) {
-            fieldRendererRef.current.clear();
+            screenRenderer?.clear();
+            customRenderer?.clear();
             return;
           }
 
@@ -675,31 +1044,59 @@ export function RadarMap({
             fallbackFrame.gates
           );
 
-          fieldRendererRef.current.render({
-            map,
-            site: {
-              latitude: fallbackSite.latitude,
-              longitude: fallbackSite.longitude
-            },
-            fieldKey: `synthetic:${stateRef.current.sourceId}`,
-            allRadials: syntheticRadials,
-            radialCountHint: syntheticRadials.length,
-            radialOverlapPaddingDegrees: defaultRadialOverlapPaddingDegrees,
-            forceRebuild: true,
-            debugMode: radarWebglDebugMode(),
-            debugBoundaryOutlines: boundaryRadarDebugMode
-          });
+          const fallbackRenderSite = {
+            latitude: fallbackSite.latitude,
+            longitude: fallbackSite.longitude
+          };
+
+          if (customRenderer) {
+            customRenderer.setData({
+              site: fallbackRenderSite,
+              fieldKey: `synthetic:${stateRef.current.sourceId}`,
+              allRadials: syntheticRadials,
+              radialCountHint: syntheticRadials.length,
+              radialOverlapPaddingDegrees: defaultRadialOverlapPaddingDegrees,
+              forceRebuild: true,
+              debugMode: radarWebglDebugMode(),
+              debugBoundaryOutlines: boundaryRadarDebugMode
+            });
+          } else {
+            screenRenderer?.render({
+              map,
+              site: fallbackRenderSite,
+              fieldKey: `synthetic:${stateRef.current.sourceId}`,
+              allRadials: syntheticRadials,
+              radialCountHint: syntheticRadials.length,
+              radialOverlapPaddingDegrees: defaultRadialOverlapPaddingDegrees,
+              forceRebuild: true,
+              debugMode: radarWebglDebugMode(),
+              debugBoundaryOutlines: boundaryRadarDebugMode
+            });
+          }
+          lastFullRedrawMsRef.current = performance.now() - redrawStartMs;
+          refreshInteractionDebugStats();
           return;
         }
 
-        fieldRendererRef.current.clear();
+        screenRenderer?.clear();
+        customRenderer?.clear();
       } catch (error) {
         console.error("Radar redraw failed", error);
       }
     };
 
     const scheduleFieldRedraw = () => {
+      if (interactionActiveRef.current) {
+        needsFullFieldRedrawRef.current = true;
+        debugInteraction("field redraw deferred during interaction");
+        return;
+      }
+
       if (frameRef.current !== null) {
+        debugInteraction("scheduleFieldRedraw queued", {
+          queuedFrame: frameRef.current,
+          interactionActive: interactionActiveRef.current
+        });
         return;
       }
 
@@ -710,59 +1107,129 @@ export function RadarMap({
     };
 
     drawRef.current = scheduleFieldRedraw;
+    drawSweepRef.current = scheduleSweepOverlayRedraw;
 
     map.on("load", () => {
+      if (customFieldRendererRef.current && !map.getLayer(radarCustomLayerId)) {
+        map.addLayer(customFieldRendererRef.current);
+      }
+
+      ensureSelectableRadarSiteLayers(
+        map,
+        selectionRef.current.selectableSites,
+        selectionRef.current.activeSourceId
+      );
       redrawField();
       redrawSweepOverlay();
 
       sweepControllerRef.current?.start(({ angleDegrees }) => {
-        sweepAngleDegreesRef.current = angleDegrees;
-        redrawSweepOverlay(angleDegrees);
+        scheduleSweepOverlayRedraw(angleDegrees);
       });
 
       const scheduleProjectedFieldRedraw = () => {
-        needsFullFieldRedrawRef.current = true;
+        if (interactionActiveRef.current) {
+          scheduleSweepOverlayRedraw();
+          if (!customFieldRendererRef.current) {
+            scheduleFieldInteractionTransform();
+          }
+          return;
+        }
+
+        if (!customFieldRendererRef.current) {
+          needsFullFieldRedrawRef.current = true;
+        }
+        scheduleSweepOverlayRedraw();
         scheduleFieldRedraw();
+      };
+
+      const beginInteraction = () => {
+        if (interactionActiveRef.current) {
+          return;
+        }
+
+        const liveFrame =
+          stateRef.current.frameManifest ??
+          stateRef.current.liveUpdate?.frame ??
+          stateRef.current.bootstrapField?.frame;
+        const renderSite = resolveRadarRenderSite(stateRef.current.sourceId, liveFrame);
+
+        interactionActiveRef.current = true;
+        interactionRenderCountRef.current = 0;
+        interactionTransformRef.current =
+          customFieldRendererRef.current || stateRef.current.sourceKind === "mrms" || !renderSite
+            ? null
+            : {
+                site: renderSite.site,
+                startZoom: map.getZoom(),
+                startPoint: map.project([
+                  renderSite.site.longitude,
+                  renderSite.site.latitude
+                ] as LngLatLike)
+              };
+        if (!customFieldRendererRef.current) {
+          scheduleFieldInteractionTransform();
+        }
+
+        if (interactionRadarDebugMode) {
+          setInteractionDebugActive(true);
+          refreshInteractionDebugStats();
+        }
+      };
+
+      const endInteraction = () => {
+        if (!interactionActiveRef.current) {
+          return;
+        }
+
+        interactionActiveRef.current = false;
+        interactionTransformRef.current = null;
+        clearFieldInteractionTransform();
+
+        if (interactionRadarDebugMode) {
+          setInteractionDebugActive(false);
+          refreshInteractionDebugStats();
+        }
+
+        if (!customFieldRendererRef.current) {
+          needsFullFieldRedrawRef.current = true;
+        }
+
+        if (needsFullFieldRedrawRef.current) {
+          redrawField();
+        }
         redrawSweepOverlay();
       };
 
       const syncProjectedFieldToMapFrame = () => {
-        if (
-          stateRef.current.sourceKind === "mrms" ||
-          (!map.isMoving() && !map.isZooming() && !map.isRotating())
-        ) {
+        if (stateRef.current.sourceKind === "mrms") {
           return;
         }
 
-        if (frameRef.current !== null) {
-          window.cancelAnimationFrame(frameRef.current);
-          frameRef.current = null;
+        if (!customFieldRendererRef.current) {
+          scheduleFieldInteractionTransform();
         }
-
-        needsFullFieldRedrawRef.current = true;
-        redrawField();
-        redrawSweepOverlay();
+        scheduleSweepOverlayRedraw();
       };
 
-      map.on("render", syncProjectedFieldToMapFrame);
+      map.on("move", syncProjectedFieldToMapFrame);
+      map.on("zoom", syncProjectedFieldToMapFrame);
       map.on("resize", scheduleProjectedFieldRedraw);
+
+      map.on("movestart", beginInteraction);
+      map.on("zoomstart", beginInteraction);
 
       map.on("moveend", () => {
         if (stateRef.current.sourceKind === "mrms") {
           updateMrmsImage(map);
         }
-        needsFullFieldRedrawRef.current = true;
-        redrawField();
-        redrawSweepOverlay();
+        endInteraction();
       });
 
       map.on("zoomend", () => {
         if (stateRef.current.sourceKind === "mrms") {
           updateMrmsImage(map);
         }
-        needsFullFieldRedrawRef.current = true;
-        redrawField();
-        redrawSweepOverlay();
+        endInteraction();
       });
 
       mrmsRefreshTimerRef.current = window.setInterval(() => {
@@ -770,11 +1237,55 @@ export function RadarMap({
           updateMrmsImage(map);
         }
       }, 60_000);
+
+      map.on("click", selectableRadarSitesCircleLayerId, (event) => {
+        const selectedSourceId = String(event.features?.[0]?.properties?.sourceId ?? "");
+
+        if (!selectedSourceId || selectedSourceId === selectionRef.current.activeSourceId) {
+          return;
+        }
+
+        selectionRef.current.onSourceSelect?.(selectedSourceId);
+      });
+
+      map.on("click", selectableRadarSitesLabelLayerId, (event) => {
+        const selectedSourceId = String(event.features?.[0]?.properties?.sourceId ?? "");
+
+        if (!selectedSourceId || selectedSourceId === selectionRef.current.activeSourceId) {
+          return;
+        }
+
+        selectionRef.current.onSourceSelect?.(selectedSourceId);
+      });
+
+      map.on("mouseenter", selectableRadarSitesCircleLayerId, () => {
+        map.getCanvas().style.cursor = "pointer";
+      });
+
+      map.on("mouseleave", selectableRadarSitesCircleLayerId, () => {
+        map.getCanvas().style.cursor = "";
+      });
+
+      map.on("mouseenter", selectableRadarSitesLabelLayerId, () => {
+        map.getCanvas().style.cursor = "pointer";
+      });
+
+      map.on("mouseleave", selectableRadarSitesLabelLayerId, () => {
+        map.getCanvas().style.cursor = "";
+      });
     });
 
     return () => {
       if (frameRef.current !== null) {
         window.cancelAnimationFrame(frameRef.current);
+      }
+
+      if (sweepFrameRef.current !== null) {
+        window.cancelAnimationFrame(sweepFrameRef.current);
+      }
+
+      if (transformFrameRef.current !== null) {
+        window.cancelAnimationFrame(transformFrameRef.current);
       }
 
       if (mrmsRefreshTimerRef.current !== null) {
@@ -785,11 +1296,27 @@ export function RadarMap({
       sweepControllerRef.current = null;
       fieldRendererRef.current?.dispose();
       fieldRendererRef.current = null;
+      if (map.getLayer(radarCustomLayerId)) {
+        map.removeLayer(radarCustomLayerId);
+      }
+      customFieldRendererRef.current = null;
+      clearFieldInteractionTransform();
       map.remove();
       mapRef.current = null;
       drawRef.current = null;
+      drawSweepRef.current = null;
     };
   }, []);
+
+  useEffect(() => {
+    const map = mapRef.current;
+
+    if (!map || !map.isStyleLoaded()) {
+      return;
+    }
+
+    ensureSelectableRadarSiteLayers(map, selectableSites, activeSourceId);
+  }, [selectableSites, activeSourceId]);
 
   useEffect(() => {
     sweepControllerRef.current?.setRotationPeriodMs(rotationPeriodMs);
@@ -804,11 +1331,21 @@ export function RadarMap({
 
     needsFullFieldRedrawRef.current = true;
     fieldIdentityRef.current = null;
+    interactionActiveRef.current = false;
+    interactionTransformRef.current = null;
     sweepControllerRef.current?.reset();
     clearOverlayCanvas(sweepCanvasRef.current);
+    const fieldCanvas = fieldCanvasRef.current;
+
+    if (fieldCanvas) {
+      fieldCanvas.style.transform = "";
+      fieldCanvas.style.transformOrigin = "";
+      fieldCanvas.style.willChange = "";
+    }
 
     if (sourceKind === "mrms") {
       fieldRendererRef.current?.clear();
+      customFieldRendererRef.current?.clear();
       map.easeTo({
         center: [-96.5, 38.5],
         duration: 700,
@@ -830,10 +1367,26 @@ export function RadarMap({
       zoom: 6
     });
     drawRef.current?.();
+    drawSweepRef.current?.();
   }, [sourceId, sourceKind]);
 
   useEffect(() => {
+    const redrawSignature = radarMapPropsSignature({
+      sourceId,
+      sourceKind,
+      frameManifest,
+      liveUpdate,
+      bootstrapField,
+      allowSyntheticFallback
+    });
+
+    if (lastRenderSignatureRef.current === redrawSignature && !needsFullFieldRedrawRef.current) {
+      return;
+    }
+
+    lastRenderSignatureRef.current = redrawSignature;
     drawRef.current?.();
+    drawSweepRef.current?.();
   }, [sourceId, sourceKind, frameManifest, liveUpdate, bootstrapField, allowSyntheticFallback]);
 
   return (
@@ -854,6 +1407,31 @@ export function RadarMap({
                 : "waiting for live Level II frame"}
         </span>
       </div>
+      {interactionRadarDebugMode ? (
+        <div className="radar-debug-interaction">
+          <strong>Radar interaction</strong>
+          <span>
+            {interactionDebugActive
+              ? customFieldRendererRef.current
+                ? "active - custom layer camera"
+                : "active - transform mode"
+              : "idle"}
+          </span>
+          <span>{`renderer ${customFieldRendererRef.current ? "maplibre custom layer" : "screen canvas"}`}</span>
+          <span>{`transform ${interactionDebugStats.transformActive ? "on" : "off"}`}</span>
+          <span>{`renders during interaction ${interactionDebugStats.renderCount}`}</span>
+          <span>{`custom frames ${interactionDebugStats.customLayerRenderCount}`}</span>
+          <span>{`data rebuilds ${interactionDebugStats.customLayerDataRebuildCount}`}</span>
+          <span>{`fps est ${interactionDebugStats.customLayerFps}`}</span>
+          <span>
+            {`last full redraw ${
+              interactionDebugStats.lastFullRedrawMs == null
+                ? "-"
+                : `${interactionDebugStats.lastFullRedrawMs.toFixed(1)} ms`
+            }`}
+          </span>
+        </div>
+      ) : null}
       {slotRadarDebugMode ? (
         <div className="radar-debug-overlay">
           <strong>slot debug</strong>
@@ -866,3 +1444,42 @@ export function RadarMap({
     </div>
   );
 }
+
+function areRadarMapPropsEqual(prevProps: RadarMapProps, nextProps: RadarMapProps) {
+  const prevSelectableSites = prevProps.selectableSites ?? [];
+  const nextSelectableSites = nextProps.selectableSites ?? [];
+  const selectableSitesEqual =
+    prevSelectableSites.length === nextSelectableSites.length &&
+    prevSelectableSites.every((site, index) => {
+      const nextSite = nextSelectableSites[index];
+      if (!nextSite) {
+        return false;
+      }
+
+      return (
+        site.sourceId === nextSite.sourceId &&
+        site.latitude === nextSite.latitude &&
+        site.longitude === nextSite.longitude
+      );
+    });
+
+  return (
+    prevProps.sourceId === nextProps.sourceId &&
+    prevProps.sourceKind === nextProps.sourceKind &&
+    prevProps.activeSourceId === nextProps.activeSourceId &&
+    selectableSitesEqual &&
+    prevProps.allowSyntheticFallback === nextProps.allowSyntheticFallback &&
+    prevProps.rotationPeriodMs === nextProps.rotationPeriodMs &&
+    prevProps.frameManifest?.id === nextProps.frameManifest?.id &&
+    prevProps.frameManifest?.sequence === nextProps.frameManifest?.sequence &&
+    prevProps.frameManifest?.chunkSequence === nextProps.frameManifest?.chunkSequence &&
+    prevProps.liveUpdate?.sequence === nextProps.liveUpdate?.sequence &&
+    prevProps.liveUpdate?.frame?.sequence === nextProps.liveUpdate?.frame?.sequence &&
+    prevProps.liveUpdate?.frame?.chunkSequence === nextProps.liveUpdate?.frame?.chunkSequence &&
+    prevProps.bootstrapField?.sequence === nextProps.bootstrapField?.sequence &&
+    prevProps.bootstrapField?.frame?.sequence === nextProps.bootstrapField?.frame?.sequence &&
+    prevProps.bootstrapField?.frame?.chunkSequence === nextProps.bootstrapField?.frame?.chunkSequence
+  );
+}
+
+export const RadarMap = memo(RadarMapInner, areRadarMapPropsEqual);

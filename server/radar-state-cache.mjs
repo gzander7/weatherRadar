@@ -117,6 +117,14 @@ function composeVisibleRadials(currentSweep, previousSweep) {
   return sortRadials(composed.values());
 }
 
+function visibleRadialCount(currentSweep, previousSweep) {
+  return Math.max(
+    currentSweep?.radialCount ?? 0,
+    previousSweep?.radialCount ?? 0,
+    720
+  );
+}
+
 function oldestTime(...timestamps) {
   const parsed = timestamps
     .filter(Boolean)
@@ -231,7 +239,7 @@ export class RadarStateCache {
         product: state.product,
         sequence: state.sequence,
         gateCount,
-        radialCount: visibleRadials.length
+        radialCount: visibleRadialCount(state.currentSweep, state.previousSweep)
       },
       radials: visibleRadials
     };

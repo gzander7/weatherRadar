@@ -125,3 +125,18 @@ test("snapshot keeps previous sweep data when a new sweep starts", () => {
   assert.equal(snapshot.previousSweep.radials[0].radialIndex, 10);
   assert.equal(snapshot.radials.length, 2);
 });
+
+test("snapshot preserves physical radial resolution for sparse visible data", () => {
+  const cache = new RadarStateCache();
+  cache.updateFromPatch({
+    stationId: "KEAX",
+    product: "REF",
+    tilt: 0.5,
+    frame: frame({ radialCount: 720 }),
+    radials: [radial(10), radial(200)]
+  });
+
+  const snapshot = cache.getSnapshot("KEAX", "REF", 0.5);
+  assert.equal(snapshot.radials.length, 2);
+  assert.equal(snapshot.frame.radialCount, 720);
+});

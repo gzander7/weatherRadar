@@ -27,6 +27,7 @@ type WorkerResponse =
 const sweepStates = new Map<string, SweepState>();
 const rollingFields = new Map<string, RollingFieldState>();
 const latestFieldKeyBySource = new Map<string, string>();
+const baseReflectivityRadialCount = 720;
 
 function sweepKey(frame: Pick<LiveRadarFrameManifest, "site" | "volumeId" | "tiltIndex" | "product">) {
   return [frame.site, frame.volumeId ?? "live", frame.tiltIndex, frame.product].join(":");
@@ -80,7 +81,7 @@ function resolveAssignedSlot(
   frame: Pick<LiveRadarFrameManifest, "radialCount">,
   radial: LiveRadarRadial
 ) {
-  const radialCount = Math.max(1, frame.radialCount ?? 720);
+  const radialCount = Math.max(1, frame.radialCount ?? baseReflectivityRadialCount);
   const azimuthCenter = angularMidpointDegrees(radial.azimuthStart, radial.azimuthEnd);
 
   if (Number.isFinite(azimuthCenter)) {
@@ -143,7 +144,7 @@ function copyFrameWithCounts(
 ): LiveRadarFrameManifest {
   return {
     ...frame,
-    radialCount: frame.radialCount ?? radialCount,
+    radialCount: Math.max(frame.radialCount ?? baseReflectivityRadialCount, radialCount),
     gateCount
   };
 }
